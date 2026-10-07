@@ -1,103 +1,159 @@
-# Mobility Pattern Mining via Heterogeneous Graph Neural Networks
+# Transportation Mode Classification from GPS Trajectories Using Graph Attention Networks
 
-**Author:** [Your Name]  
-**Date:** March 2026
+Official code for the paper published at the **27th IEEE International Conference on Mobile Data Management (MDM 2026)**.
 
-## 1. Abstract / Introduction
-This project presents a novel framework for analyzing urban mobility patterns using **Heterogeneous Graph Neural Networks (HeteroGNNs)**. Unlike traditional sequence-based models (RNNS, LSTMs) that treat trajectories as simple chains of coordinates, our approach models the entire urban mobility ecosystem as a complex network. By representing both **Geographic Regions** (H3 hexagons) and **User Trajectories** as distinct node types in a shared graph, we can learn rich, semantic embeddings that capture:
-1.  **Transport Modes** (Walking vs. Driving vs. Public Transit)
-2.  **Unlabelled Life Patterns** (Commuting, Leisure, Delivery behaviors)
+**Authors:** Sangrez Khan, Umar Farooq, John Violos, Hanna Kavalionak, Emanuele Carlini, Aris Leivadeas
+**Paper:** [doi.org/10.1109/MDM71479.2026.00083](https://doi.org/10.1109/MDM71479.2026.00083)
 
-This repository contains the complete implementation, from raw GPS processing to the generation of publication-ready visualization artifacts.
+## Overview
 
-## 2. Methodology
+We classify the transportation mode of GPS trajectory segments (**Walk, Bike, Bus, Car, Subway, Taxi**) using a hybrid *wide-and-deep* model that combines:
 
-### A. Spatial Discretization (H3 Hexagonal Grid)
-Raw GPS data is noisy and continuous. We first discretize the city of Beijing into a hexagonal grid using Uber's **H3 system** (Resolution 9, approx. $0.1 \text{km}^2$ per cell). This transforms a trajectory $T = \{(lat_1, lon_1), \dots, (lat_n, lon_n)\}$ into a sequence of tokens $H = \{h_1, h_2, \dots, h_m\}$.
+- **Deep branch:** a Graph Attention Network (4 × GATv2Conv) that learns spatial embeddings from trajectory graphs built on the Uber [H3](https://github.com/uber/h3) hexagonal grid.
+- **Wide branch:** a small MLP over 12 handcrafted kinematic and temporal features.
+- **Two-stage transfer learning:** the model is first pretrained on *user identification*, which uses every segment, labelled or not. It is then fine-tuned for transportation mode classification with a class-weighted Focal Loss.
 
-### B. Heterogeneous Graph Construction
-We construct a graph $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ with two types of nodes:
-*   **Region Nodes ($V_R$):** represent physical location hexes.
-    *   *Features:* Centroid Lat/Lon (Normalized).
-*   **Trajectory Nodes ($V_T$):** represent individual trips.
-    *   *Features:* Average Velocity ($m/s$), Log-Duration ($log(t)$), Displacement.
+On GeoLife the model reaches **91.27 % accuracy** and **91.59 % macro F1**. That beats Random Forest, LSTM and CNN baselines, and a standard GNN by more than 5.2 F1 points.
 
-We define three types of edges to model interactions:
-1.  **Region-Region ($E_{RR}$):** Spatial adjacency (Grid neighbors).
-2.  **Trajectory-Region ($E_{TR}$):** "Visits" (A trajectory passes through a region).
-3.  **Region-Trajectory ($E_{RT}$):** "Hosted by" (Reverse edge for message passing).
+![Architecture](figures/architecture.png)
 
-### C. Graph Neural Network Architecture
-We employ a **Heterogeneous GraphSAGE** architecture. The model learns by aggregating messages across the different relation types:
+## Method
 
-$$
-h_v^{(l+1)} = \sigma \left( \sum_{r \in \mathcal{R}} \sum_{u \in \mathcal{N}_r(v)} W_r^{(l)} \cdot h_u^{(l)} \right)
-$$
+**Graph construction.** Each GPS point is mapped to an H3 cell at resolution 9 (about 0.105 km² per cell, about 200 m edge length). Trajectories are cut into sliding windows (W = 100 points, stride S = 50). Each window becomes a graph whose nodes are H3 cells. It has three kinds of directed edges:
 
-Where $\mathcal{R}$ represents the relation types (e.g., *Visits*, *Neighbors*).
-*   **Layer 1:** Regions aggregate info from neighbors (map context) and visiting trajectories (traffic flow).
-*   **Layer 2:** Trajectories aggregate refined info from the regions they visited (path context).
+1. sequential forward edges
+2. sequential backward edges, for bidirectional message passing
+3. skip-ahead edges (i → i+2), to widen the receptive field
 
-### D. Learning Objectives
-1.  **Supervised classification:** We train the model to classify transport modes (Car, Bus, Walk, etc.) on a labeled subset of the GeoLife data.
-2.  **Unsupervised Clustering:** We project the learned embeddings of *unlabeled* trajectories into a latent space and perform K-Means clustering to discover hidden mobility patterns ("Life Patterns").
+Every edge carries a 6-d attribute vector: cumulative distance, elapsed time, average speed, acceleration, heading change and speed ratio.
 
-## 3. Dataset
-*   **Source:** Microsoft GeoLife GPS Trajectories (Beijing subset).
-*   **Scale:** ~18,000 trajectories processed.
-*   **Classes:** 10 modes including *Walk, Bike, Bus, Car, Subway, Train*.
-*   **Preprocessing:** Trajectories split by 20-minute gaps; filtered for valid GPS signals.
+**Wide features (12-d, all scaled to [0, 1]):**
 
-## 4. Experimental Results & Artifacts
+- log-scaled 85th-percentile speed
+- stop ratio (< 1 m/s)
+- log speed variance
+- mean heading-change rate
+- straightness ratio
+- log mean absolute acceleration
+- sin/cos of the hour of day
+- sin/cos of the day of week
+- brief-stop rate (30–120 s stops, a taxi pickup signature)
+- velocity entropy
 
-The pipeline generates three key figures suitable for an IEEE workshop paper:
+**Encoder.** Four GATv2Conv layers (4, 4, 2 and 1 heads) with ELU activation, dropout and residual connections. The graph embedding is soft-attention pooling plus global max pooling. It is concatenated with the wide-branch output, then passed to a linear softmax classifier.
 
-### Figure 1: Classification Performance (`Slide1_ConfusionMatrix.png`)
-*   **Description:** A confusion matrix showing the model's ability to distinguish between transport modes.
-*   **Analysis:** High accuracy on *Walk* vs. *Car* confirms the efficacy of Velocity features. Confusion between *Bus* and *Car* highlights the complexity of shared road networks.
+**Training.**
 
-### Figure 2: Physics-Aware Embeddings (`Slide2_Speed_Analysis.png`)
-*   **Description:** Boxplots of Average Speed vs. Transport Mode.
-*   **Analysis:** This validates the feature engineering. The clear separation (Walk < Bike < Bus < Car < Train) provides a strong signal for the GNN to learn from.
+- *Phase 1 (pretraining):* user-ID prediction with cross-entropy on all segments.
+- *Phase 2 (fine-tuning):* labelled segments only, with class-weighted Focal Loss (γ = 2.5, label smoothing 0.1) and early stopping on validation macro F1.
+- Both phases use AdamW, cosine LR schedules and gradient clipping at 1.0.
+- The data is split 80 / 10 / 10, stratified.
 
-### Figure 3: Discovery of Life Patterns (`Slide3_Life_Patterns.html`)
-*   **Description:** An interactive map visualizing the spatial distribution of 3 unsupervised clusters found in the unlabeled data.
-*   **Interpretation:**
-    *   *Cluster 0 (Red):* Short, dense trips in city center $\rightarrow$ likely **Last-mile delivery / Commute**.
-    *   *Cluster 1 (Green):* Long, arterial trips $\rightarrow$ likely **Highway transit**.
-    *   *Cluster 2 (Blue):* Parks and residential areas $\rightarrow$ likely **Leisure walking**.
+### Hyperparameters
 
-## 5. How to Reproduce
+| Parameter | Value |
+|---|---|
+| Node embedding dimension | 256 |
+| GATv2Conv blocks | 4 |
+| Wide branch input size | 12 |
+| Batch size | 64 |
+| Pretraining: epochs / LR / weight decay | 20 / 1e-3 / 1e-4 |
+| Pretraining LR schedule | Cosine annealing with warmup |
+| Fine-tuning: LR / loss | 5e-4 / class-weighted Focal Loss |
+| Focal γ / label smoothing | 2.5 / 0.1 |
+| Fine-tuning LR schedule | Cosine warm restarts (T₀ = 10) |
+| Early-stopping patience | 10 |
 
-### Prerequisites
-*   Python 3.8+
-*   PyTorch, PyTorch Geometric, Pandas, H3, Folium, Seaborn
+## Results (GeoLife, held-out test set)
 
-### Steps
-1.  **Preprocess Data:**
-    ```bash
-    python 01_preprocess.py
-    ```
-    *Extracts speed features and maps GPS to H3.*
+| Method | Accuracy | Precision | Recall | F1 |
+|---|---|---|---|---|
+| Random Forest | 0.8189 | 0.8386 | 0.7601 | 0.7886 |
+| LSTM | 0.7026 | 0.6454 | 0.6618 | 0.6496 |
+| CNN | 0.7182 | 0.6585 | 0.7145 | 0.6735 |
+| GNN | 0.8660 | 0.8610 | 0.8682 | 0.8630 |
+| **Proposed** | **0.9127** | **0.9114** | **0.9200** | **0.9159** |
 
-2.  **Build Graph:**
-    ```bash
-    python 02_build_graph.py
-    ```
-    *Constructs the `geolife_graph.pt` HeteroData object.*
+Per-class results of the proposed model:
 
-3.  **Train & Visualize:**
-    ```bash
-    python 03_train_and_evaluate.py
-    ```
-    *Trains the Model for 60 epochs and generates all Slide images.*
+| Mode | Precision | Recall | F1 |
+|---|---|---|---|
+| Walk | 0.92 | 0.91 | 0.91 |
+| Bike | 0.93 | 0.95 | 0.94 |
+| Bus | 0.92 | 0.91 | 0.92 |
+| Car | 0.90 | 0.92 | 0.91 |
+| Subway | 0.93 | 0.96 | 0.95 |
+| Taxi | 0.84 | 0.85 | 0.84 |
 
-4.  **Similarity Search:**
-    ```bash
-    python 04_similarity_search.py
-    ```
-    *Demonstrates vector search for finding similar trips.*
+| Confusion matrix (%) | Validation macro F1 |
+|---|---|
+| ![](figures/confusion_matrix.png) | ![](figures/validation_macro_f1.png) |
+| **Training / validation accuracy** | **Training / validation loss** |
+| ![](figures/train_val_accuracy.png) | ![](figures/train_val_loss.png) |
 
-## 6. Citation
-If used, please cite the GeoLife dataset:
-*Yu Zheng, Lizhu Zhang, Xing Xie, Wei-Ying Ma. Mining interesting locations and travel sequences from GPS trajectories. WWW 2009.*
+## Repository structure
+
+```
+├── train_gat.py         # Preprocessing, graph construction, two-phase training, evaluation and plots
+├── baselines.py         # Random Forest / LSTM / CNN / GNN (GraphSAGE) baselines
+├── generate_figure.py   # Draws the architecture figure
+├── figures/             # Result plots and the architecture diagram
+└── requirements.txt
+```
+
+## Getting started
+
+### 1. Install
+
+```bash
+pip install -r requirements.txt
+```
+
+Install PyTorch and PyTorch Geometric to match your CUDA version. See the [PyG installation guide](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html).
+
+### 2. Get the data
+
+Download [GeoLife GPS Trajectories v1.3](https://www.microsoft.com/en-us/download/details.aspx?id=52367) from Microsoft Research. Extract it so the user folders sit at `./Geolife/data/000`, `./Geolife/data/001` and so on, or change `DATASET_ROOT` in `train_gat.py`.
+
+Only points inside the Beijing bounding box (lat 39.75–40.10, lon 116.15–116.60) are used.
+
+### 3. Train and evaluate
+
+```bash
+python train_gat.py
+```
+
+The first run processes GeoLife into per-segment graphs under `./geolife_processed_7class_v2/`. It then pretrains, fine-tunes and evaluates the model. The outputs are:
+
+- the best checkpoint (`best_model_6class_v2.pth`)
+- the final model (`production_model_6class_v2.pth`)
+- the result plots, as PNG, SVG and PDF
+
+### 4. Baselines
+
+```bash
+python baselines.py --processed-dir ./geolife_processed_7class_v2
+```
+
+This reuses the processed graphs from step 3 and writes a CSV of metrics for each baseline.
+
+## Citation
+
+```bibtex
+@inproceedings{khan2026transportation,
+  title     = {Transportation Mode Classification from GPS Trajectories Using Graph Attention Networks},
+  author    = {Khan, Sangrez and Farooq, Umar and Violos, John and Kavalionak, Hanna and Carlini, Emanuele and Leivadeas, Aris},
+  booktitle = {2026 27th IEEE International Conference on Mobile Data Management (MDM)},
+  pages     = {501--506},
+  year      = {2026},
+  doi       = {10.1109/MDM71479.2026.00083}
+}
+```
+
+## Acknowledgment
+
+This work is part of the **MUlti-Sensor Inferred Trajectories (MUSIT)** project. MUSIT has received funding from the European Union's HORIZON-MSCA-2023-SE-01 research and innovation programme under grant agreement No 101182585.
+
+## License
+
+Released under the [MIT License](LICENSE).
